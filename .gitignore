@@ -1,0 +1,50 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+.venv/
+venv/
+env/
+ENV/
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.ipynb_checkpoints/
+
+# Streamlit
+.streamlit/secrets.toml
+.streamlit/state.json
+
+# Env files (secrets)
+.env
+*.env
+.env.*.local
+
+# Logs
+logs/
+*.log
+*.gz
+
+# Build / cache
+build/
+dist/
+coverage/
+.coverage
+.cache/
+.tmp/
+.temp/
+
+# OS / Editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# If repo me Node part bhi hai to:
+node_modules/
+pnpm-lock.yaml
+yarn.lock
+package-lock.json
