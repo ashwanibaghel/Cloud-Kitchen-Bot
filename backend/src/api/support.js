@@ -34,7 +34,11 @@ router.get('/', async (req, res) => {
 router.patch('/:id', async (req, res) => {
   try {
     await db.collection('support').doc(req.params.id).update(req.body);
-    res.json({ success: true });
+    const updatedDoc = await db.collection('support').doc(req.params.id).get();
+    if (!updatedDoc.exists) {
+      return res.status(404).json({ error: 'Support ticket not found' });
+    }
+    res.json({ id: updatedDoc.id, ...updatedDoc.data() });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }

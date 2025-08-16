@@ -9,15 +9,19 @@ router.get('/bestsellers', async (req, res) => {
     const counts = {};
     orders.forEach(doc => {
       (doc.data().items || []).forEach(i => {
-        counts[i.itemId] = (counts[i.itemId] || 0) + i.qty;
+        counts[i.itemId] = (counts[i.itemId] || 0) + (i.qty || 1);
       });
     });
     const sorted = Object.entries(counts).sort((a, b) => b[1] - a[1]);
     const menuSnapshot = await db.collection('menu').get();
     const menuMap = {};
     menuSnapshot.forEach(doc => menuMap[doc.id] = doc.data());
-    const bestsellers = sorted.map(([id, qty]) => ({ id, name: menuMap[id]?.name || id, price: menuMap[id]?.price || 0, sold: qty }));
-    res.json({ bestsellers });
+    const bestsellers = sorted.map(([itemId, sold]) => ({ 
+      name: menuMap[itemId]?.name || `Item ${itemId}`, 
+      itemId, 
+      sold 
+    }));
+    res.json(bestsellers);
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -28,10 +32,13 @@ router.get('/orders-per-day', async (req, res) => {
     const orders = await db.collection('orders').get();
     const byDate = {};
     orders.forEach(doc => {
-      const date = new Date(doc.data().createdAt).toISOString().slice(0, 10);
-      byDate[date] = (byDate[date] || 0) + 1;
+      const createdAt = doc.data().createdAt;
+      if (createdAt) {
+        const date = new Date(createdAt).toISOString().slice(0, 10);
+        byDate[date] = (byDate[date] || 0) + 1;
+      }
     });
-    res.json({ ordersPerDay: byDate });
+    res.json(byDate);
   } catch (err) {
     res.status(500).json({ error: err.message });
   }

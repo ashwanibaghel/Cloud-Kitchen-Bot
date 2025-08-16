@@ -29,19 +29,23 @@ router.get('/', async (req, res) => {
 
 router.post('/', async (req, res) => {
   try {
-    const { userId, items, total, status, scheduledFor } = req.body;
-    if (!userId || !items || !total) return res.status(400).json({ error: "Missing fields" });
+    const { userId, items, total, status, scheduledFor, deliveryAddress } = req.body;
+    if (!userId || !items || !Array.isArray(items) || !total) {
+      return res.status(400).json({ error: "userId, items (array), and total required" });
+    }
     const order = {
       userId,
       items,
-      total,
+      total: Number(total),
       status: status || 'pending_payment',
-      createdAt: Date.now(),
-      scheduledFor: scheduledFor || null
+      createdAt: req.body.createdAt || Date.now(),
+      scheduledFor: scheduledFor || null,
+      deliveryAddress: deliveryAddress || null
     };
-    await db.collection('orders').doc(uuidv4()).set(order);
+    const docRef = await db.collection('orders').doc(uuidv4());
+    await docRef.set(order);
     await db.collection('carts').doc(userId).set({ items: [] });
-    res.json({ success: true });
+    res.json({ success: true, orderId: docRef.id });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }

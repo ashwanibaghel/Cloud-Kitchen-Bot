@@ -46,6 +46,22 @@ app.use('/api/analytics', analyticsRouter);
 app.use('/api/privacy', privacyRouter);
 app.use('/api/admin', adminRouter);
 
+// 404 handler for API routes
+app.use('/api/*', (req, res) => {
+  res.status(404).json({ error: 'API endpoint not found' });
+});
+
+// Global error handler
+app.use((err, req, res, next) => {
+  console.error('Error:', err.message);
+  res.status(500).json({ 
+    error: process.env.NODE_ENV === 'production' ? 'Internal server error' : err.message 
+  });
+});
+
 // Start server
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
+
+// Export app for tests
+module.exports = app;

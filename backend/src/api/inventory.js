@@ -23,4 +23,13 @@ router.patch('/:id', async (req, res) => {
   }
 });
 
+router.post('/', async (req, res) => {
+  try {
+    const docRef = await db.collection('inventory').add(req.body);
+    res.json({ success: true, id: docRef.id });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 module.exports = router;

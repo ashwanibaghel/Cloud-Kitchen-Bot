@@ -59,4 +59,13 @@ router.patch('/promos/:id', async (req, res) => {
   }
 });
 
+router.delete('/promos/:id', async (req, res) => {
+  try {
+    await db.collection('promos').doc(req.params.id).delete();
+    res.json({ success: true });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 module.exports = router;
