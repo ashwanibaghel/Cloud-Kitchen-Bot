@@ -1,73 +1,120 @@
 const express = require('express');
-const db = require('../services/firebase');
-const { v4: uuidv4 } = require('uuid');
-
 const router = express.Router();
+const { db } = require('../services/firebase');
 
-// Store addresses in addresses/{userId} => { addresses: [ {id, line1, city, pincode, tag, default } ] }
+// Helpers to keep backward compatibility (single address) and support multiple addresses
+async function getUserDoc(userId) {
+  const ref = db.collection('users').doc(userId);
+  const snap = await ref.get();
+  return { ref, data: snap.exists ? snap.data() : {} };
+}
 
+// GET /api/address/:userId
+// Returns { userId, addresses: [...], defaultAddress }
 router.get('/:userId', async (req, res) => {
   try {
-    const doc = await db.collection('addresses').doc(req.params.userId).get();
-    const data = doc.exists ? doc.data() : { addresses: [] };
-    res.json(data);
-  } catch (e) {
-    res.status(500).json({ error: e.message });
+    const { userId } = req.params;
+    const { data } = await getUserDoc(userId);
+    const addresses = Array.isArray(data.addresses) ? data.addresses : (data.address ? [{ id: 'default', label: 'Default', address: data.address, isDefault: true }] : []);
+    const defaultAddress = addresses.find(a => a.isDefault) || addresses[0] || null;
+    res.json({ userId, addresses, defaultAddress });
+  } catch {
+    res.status(500).json({ error: 'Failed to fetch addresses.' });
   }
 });
 
+// POST /api/address/:userId
+// Body can be { address } (legacy) OR { label, address, isDefault? }
 router.post('/:userId', async (req, res) => {
   try {
-    const userId = req.params.userId;
-    const { line1, line2, city, state, pincode, tag, isDefault } = req.body;
-    if (!line1 || !city || !pincode) return res.status(400).json({ error: "line1, city, pincode required" });
-    const id = uuidv4();
-    const docRef = db.collection('addresses').doc(userId);
-    const doc = await docRef.get();
-    const current = doc.exists ? doc.data().addresses || [] : [];
-    const next = current.map(a => ({ ...a, default: isDefault ? false : a.default }));
-    next.push({ id, line1, line2: line2 || "", city, state: state || "", pincode, tag: tag || "home", default: !!isDefault });
-    await docRef.set({ addresses: next });
-    res.json({ success: true, id });
-  } catch (e) {
-    res.status(500).json({ error: e.message });
-  }
-});
+    const { userId } = req.params;
+    const body = req.body || {};
+    const { ref, data } = await getUserDoc(userId);
+    let addresses = Array.isArray(data.addresses) ? data.addresses : [];
 
-router.patch('/:userId/:addressId', async (req, res) => {
-  try {
-    const docRef = db.collection('addresses').doc(req.params.userId);
-    const doc = await docRef.get();
-    if (!doc.exists) return res.status(404).json({ error: "No addresses" });
-    let arr = doc.data().addresses || [];
-    arr = arr.map(a => {
-      if (a.id === req.params.addressId) {
-        const updated = { ...a, ...req.body };
-        if (req.body.default === true) {
-          // unset others
-          return updated;
-        }
-        return updated;
+    if (body.address && !body.label) {
+      // Legacy: single address set as default
+      addresses = [{ id: 'default', label: 'Default', address: String(body.address), isDefault: true }];
+    } else {
+      const id = Math.random().toString(36).slice(2, 10);
+      const entry = {
+        id,
+        label: String(body.label || 'Address'),
+        address: String(body.address || ''),
+        isDefault: !!body.isDefault
+      };
+      if (entry.isDefault) {
+        addresses = addresses.map(a => ({ ...a, isDefault: false }));
       }
-      return req.body.default === true ? { ...a, default: false } : a;
-    });
-    await docRef.set({ addresses: arr });
-    res.json({ success: true });
-  } catch (e) {
-    res.status(500).json({ error: e.message });
+      addresses.push(entry);
+    }
+
+    await ref.set({ addresses, updatedAt: new Date().toISOString() }, { merge: true });
+    res.status(201).json({ userId, addresses });
+  } catch {
+    res.status(500).json({ error: 'Failed to add address.' });
   }
 });
 
-router.delete('/:userId/:addressId', async (req, res) => {
+// PATCH /api/address/:userId
+// Body: { defaultId? } OR { address } (legacy update default)
+router.patch('/:userId', async (req, res) => {
   try {
-    const docRef = db.collection('addresses').doc(req.params.userId);
-    const doc = await docRef.get();
-    if (!doc.exists) return res.status(404).json({ error: "No addresses" });
-    const arr = (doc.data().addresses || []).filter(a => a.id !== req.params.addressId);
-    await docRef.set({ addresses: arr });
-    res.json({ success: true });
-  } catch (e) {
-    res.status(500).json({ error: e.message });
+    const { userId } = req.params;
+    const body = req.body || {};
+    const { ref, data } = await getUserDoc(userId);
+    let addresses = Array.isArray(data.addresses) ? data.addresses : [];
+
+    if (body.defaultId) {
+      addresses = addresses.map(a => ({ ...a, isDefault: a.id === body.defaultId }));
+    } else if (body.address && !body.label) {
+      // Legacy: update default
+      if (!addresses.length) {
+        addresses = [{ id: 'default', label: 'Default', address: String(body.address), isDefault: true }];
+      } else {
+        addresses = addresses.map(a => a.isDefault ? { ...a, address: String(body.address) } : a);
+      }
+    }
+
+    await ref.set({ addresses, updatedAt: new Date().toISOString() }, { merge: true });
+    res.json({ userId, addresses });
+  } catch {
+    res.status(500).json({ error: 'Failed to update address.' });
+  }
+});
+
+// PATCH /api/address/:userId/:addrId
+router.patch('/:userId/:addrId', async (req, res) => {
+  try {
+    const { userId, addrId } = req.params;
+    const body = req.body || {};
+    const { ref, data } = await getUserDoc(userId);
+    let addresses = Array.isArray(data.addresses) ? data.addresses : [];
+    addresses = addresses.map(a => a.id === addrId ? { ...a, ...body, id: a.id } : a);
+    if (body.isDefault) {
+      addresses = addresses.map(a => ({ ...a, isDefault: a.id === addrId }));
+    }
+    await ref.set({ addresses, updatedAt: new Date().toISOString() }, { merge: true });
+    res.json({ userId, addresses });
+  } catch {
+    res.status(500).json({ error: 'Failed to update specific address.' });
+  }
+});
+
+// DELETE /api/address/:userId/:addrId
+router.delete('/:userId/:addrId', async (req, res) => {
+  try {
+    const { userId, addrId } = req.params;
+    const { ref, data } = await getUserDoc(userId);
+    let addresses = Array.isArray(data.addresses) ? data.addresses : [];
+    addresses = addresses.filter(a => a.id !== addrId);
+    if (addresses.length && !addresses.some(a => a.isDefault)) {
+      addresses[0].isDefault = true;
+    }
+    await ref.set({ addresses, updatedAt: new Date().toISOString() }, { merge: true });
+    res.json({ userId, addresses });
+  } catch {
+    res.status(500).json({ error: 'Failed to delete address.' });
   }
 });
 

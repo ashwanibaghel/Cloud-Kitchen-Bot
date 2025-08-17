@@ -1,724 +1,791 @@
+// WhatsApp service — Zero-typing UX with a single "Show Options" list,
+// Multi-Add menu ("✓ Done Adding"), tap-to-remove, UPI link + "I've paid", COD instant confirm + live link.
+// Address flow: no rude prompts; greetings ignored; confirm Save/Change via buttons.
+
+const http = require('http');
+const https = require('https');
 const axios = require('axios');
-const db = require('./firebase');
-const { extractOrderIntent } = require('./nlp');
 const { v4: uuidv4 } = require('uuid');
+
+// Adjust this import if your firebase service exports differently
+const { db } = require('./firebase');
 
 const WA_VERSION = process.env.WA_API_VERSION || 'v20.0';
 const BASE = `https://graph.facebook.com/${WA_VERSION}`;
-const LIVE_BASE = process.env.LIVE_VIDEO_BASE_URL || 'https://your-domain.com/live'; // Set in .env
+const OWNER_WA_NUMBER = (process.env.OWNER_WA_NUMBER || '').trim();
+const LIVE_BASE = process.env.LIVE_VIDEO_BASE_URL || 'https://your-domain.com/live';
 
+const waClient = axios.create({
+  timeout: 8000,
+  httpAgent: new http.Agent({ keepAlive: true, maxSockets: 20 }),
+  httpsAgent: new https.Agent({ keepAlive: true, maxSockets: 20 }),
+  headers: {
+    Authorization: `Bearer ${process.env.WHATSAPP_TOKEN}`,
+    'Content-Type': 'application/json',
+  },
+});
+
+function nowIso() {
+  return new Date().toISOString();
+}
 async function waPost(path, data) {
   const url = `${BASE}/${path}`;
   try {
-    const res = await axios.post(url, data, {
-      headers: {
-        Authorization: `Bearer ${process.env.WHATSAPP_TOKEN}`,
-        'Content-Type': 'application/json',
-      },
-      timeout: 10000,
-    });
+    const res = await waClient.post(url, data);
     return res.data;
   } catch (e) {
-    const status = e.response?.status;
-    const body = e.response?.data;
-    console.error('[WhatsApp API Error]', status || '', body ? JSON.stringify(body, null, 2) : e.message);
+    const s = e.response?.status;
+    const b = e.response?.data;
+    console.error('[WA Error]', s || '', b ? JSON.stringify(b) : e.message);
     throw e;
   }
 }
-
-async function sendMessage(to, message, options = {}) {
+async function sendMessage(to, message) {
+  if (!to) return;
   const data = {
     messaging_product: 'whatsapp',
     to,
     type: 'text',
-    text: { body: message },
-    ...options,
+    text: { body: String(message).slice(0, 4000) },
   };
   return waPost(`${process.env.WHATSAPP_PHONE_ID}/messages`, data);
 }
-
-async function sendVideoLink(to, videoUrl) {
-  const data = {
-    messaging_product: 'whatsapp',
-    to,
-    type: 'video',
-    video: {
-      link: videoUrl,
-      caption: 'Here is your live preparation video!',
-    },
-  };
-  return waPost(`${process.env.WHATSAPP_PHONE_ID}/messages`, data);
+async function safeSend(to, message) {
+  try {
+    await sendMessage(to, message);
+  } catch (_) {}
 }
-
-async function sendMenuList(to, menuItems) {
-  const sections = [
-    {
-      title: 'Our Menu',
-      rows: menuItems.map((item) => ({
-        id: item.id,
-        title: item.name,
-        description: `₹${item.price} - ${item.description || ''}${item.available ? '' : ' (Out of stock)'}`,
-      })),
-    },
-  ];
+async function sendInteractiveList(to, headerText, bodyText, sectionTitle, rows, buttonLabel = 'Show Options') {
+  if (!to) return;
   const data = {
     messaging_product: 'whatsapp',
     to,
     type: 'interactive',
     interactive: {
       type: 'list',
-      header: { type: 'text', text: 'Cloud Kitchen Menu' },
-      body: { text: 'Select an item to add to cart:' },
-      action: { button: 'Show Menu', sections },
-    },
-  };
-  return waPost(`${process.env.WHATSAPP_PHONE_ID}/messages`, data);
-}
-
-async function sendOrderConfirmationButtons(to, orderId, total) {
-  const data = {
-    messaging_product: 'whatsapp',
-    to,
-    type: 'interactive',
-    interactive: {
-      type: 'button',
-      body: { text: `Your total is ₹${total}.\nConfirm order?` },
+      header: { type: 'text', text: headerText },
+      body: { text: bodyText },
       action: {
-        buttons: [
-          { type: 'reply', reply: { id: `confirm_${orderId}`, title: 'Yes' } },
-          { type: 'reply', reply: { id: 'cancel', title: 'No' } },
+        button: buttonLabel,
+        sections: [
+          {
+            title: sectionTitle,
+            rows: rows.map((r) => ({
+              id: r.id,
+              title: r.title,
+              description: r.description ? String(r.description).slice(0, 70) : '',
+            })),
+          },
         ],
       },
     },
   };
   return waPost(`${process.env.WHATSAPP_PHONE_ID}/messages`, data);
 }
-
-async function sendPromoCode(to, code, description) {
-  return sendMessage(to, `🎉 Promo: Use code *${code}* for ${description}!`);
+async function sendButtons(to, text, buttons) {
+  if (!to) return;
+  // buttons: [{ id, title }] max 3
+  const data = {
+    messaging_product: 'whatsapp',
+    to,
+    type: 'interactive',
+    interactive: {
+      type: 'button',
+      body: { text },
+      action: {
+        buttons: buttons.slice(0, 3).map((b) => ({
+          type: 'reply',
+          reply: { id: b.id, title: String(b.title).slice(0, 20) },
+        })),
+      },
+    },
+  };
+  return waPost(`${process.env.WHATSAPP_PHONE_ID}/messages`, data);
 }
 
-async function buildAndSendCartSummary(to) {
-  const cartDoc = await db.collection('carts').doc(to).get();
-  const items = cartDoc.exists ? cartDoc.data().items || [] : [];
+// ============ Show Options ============
+async function sendHome(to, body = 'What would you like to do?') {
+  const rows = [
+    { id: 'home:menu', title: 'Browse Menu', description: 'Add dishes to cart' },
+    { id: 'home:cart', title: 'View Cart', description: 'See or edit your cart' },
+    { id: 'home:checkout', title: 'Checkout', description: 'Place your order' },
+    { id: 'home:track', title: 'Track Order', description: 'Live status updates' },
+    { id: 'home:address', title: 'Manage Address', description: 'Save/change address' },
+    { id: 'home:coupons', title: 'Apply Coupon', description: 'Use available discounts' },
+    { id: 'home:points', title: 'Loyalty Points', description: 'Check & redeem' },
+    { id: 'home:reorder', title: 'Reorder', description: 'Repeat last order' },
+    { id: 'home:subscribe', title: 'Subscriptions', description: 'Weekly/Monthly tiffin' },
+    { id: 'home:support', title: 'Talk to Agent', description: 'Get help from a human' },
+  ];
+  await sendInteractiveList(to, 'Cloud Kitchen', body, 'Main Menu', rows, 'Show Options');
+}
+
+// ============ Heuristics ============
+function isGreeting(msg) {
+  const s = String(msg || '').trim().toLowerCase();
+  return /^(hi|hii+|hello|hey|hlo|yo|namaste|namaskar|ok|okay|thanks|thank you|thx|hola|yo+|haan|hmm)$/.test(s);
+}
+function looksLikeAddress(msg) {
+  const s = String(msg || '').trim();
+  if (s.length < 10) return false;
+  const hasNumber = /\d/.test(s);
+  const hasPin = /\b\d{6}\b|\b\d{5}\b/.test(s);
+  const hasKeyword = /(road|rd|street|st|sector|block|colony|nagar|vihar|lane|phase|apt|apartment|tower|society|bldg|building|near|opp|opposite|behind|gate|plot|flat|floor|house|no\.|area|locality|market|bazar|chowk|naka|city|pincode)/i.test(
+    s
+  );
+  const hasComma = s.includes(',');
+  return (hasNumber || hasPin) && (hasKeyword || hasComma);
+}
+
+// ============ Menu (Multi-add simulation) ============
+async function sendMenuList(to) {
+  const snap = await db.collection('menu').where('available', '==', true).get();
+  const items = snap.docs.map((d) => ({ id: d.id, ...d.data() }));
+  const rows = [
+    { id: 'menu:done', title: '✓ Done Adding', description: 'Proceed to next step' },
+    ...items.map((m) => ({
+      id: `menu:${m.id}`,
+      title: m.name,
+      description: `₹${m.price} ${m.available ? '' : '(Out of stock)'}`,
+    })),
+  ];
+  await sendInteractiveList(
+    to,
+    'Cloud Kitchen Menu',
+    'Tap items to add. Select "✓ Done Adding" when finished.',
+    'Menu',
+    rows,
+    'Show Options'
+  );
+}
+
+// ============ Cart helpers ============
+async function getCart(userId) {
+  const doc = await db.collection('carts').doc(userId).get();
+  return doc.exists ? doc.data() : { items: [] };
+}
+async function setCart(userId, cart) {
+  return db.collection('carts').doc(userId).set({ ...cart, updatedAt: nowIso() }, { merge: true });
+}
+async function sendCartSummary(userId) {
+  const cart = await getCart(userId);
+  const items = cart.items || [];
   if (!items.length) {
-    await sendMessage(to, '🛒 Your cart is empty. Reply "menu" for options.');
+    await safeSend(userId, '🛒 Your cart is empty.');
     return;
   }
-  let cartMsg = '🛒 Your Cart\n\n';
+  const menuDocs = await Promise.all(items.map((ci) => db.collection('menu').doc(ci.itemId).get()));
   let total = 0;
-  for (const ci of items) {
-    const mi = await db.collection('menu').doc(ci.itemId).get();
-    if (mi.exists) {
-      const m = mi.data();
-      const line = `${m.name} x${ci.qty}${ci.customization ? ' (' + ci.customization + ')' : ''} - ₹${(m.price || 0) * (ci.qty || 1)}\n`;
-      cartMsg += line;
-      total += (m.price || 0) * (ci.qty || 1);
-    }
+  const lines = items.map((ci, idx) => {
+    const m = menuDocs[idx].exists ? menuDocs[idx].data() : { name: 'Item', price: 0 };
+    const amt = (m.price || 0) * (ci.qty || 1);
+    total += amt;
+    return `${m.name} x${ci.qty}${ci.customization ? ' (' + ci.customization + ')' : ''} - ₹${amt}`;
+  });
+  await safeSend(userId, `🛒 Your Cart\n\n${lines.join('\n')}\n\nSubtotal: ₹${total}`);
+}
+async function sendRemoveFromCartList(to) {
+  const cart = await getCart(to);
+  const items = cart.items || [];
+  if (!items.length) {
+    await safeSend(to, 'Cart is empty.');
+    await sendHome(to, 'What next?');
+    return;
   }
-  cartMsg += `\nTotal: ₹${total}\n\nPress 4 to place order, or 1 to add more.`;
-  await sendMessage(to, cartMsg);
+  const menuDocs = await Promise.all(items.map((ci) => db.collection('menu').doc(ci.itemId).get()));
+  const rows = [
+    { id: 'remove:done', title: '✓ Done Removing', description: 'Go back' },
+    ...items.map((ci, idx) => {
+      const m = menuDocs[idx].exists ? menuDocs[idx].data() : { name: 'Item' };
+      return { id: `remove:${idx}`, title: `Remove ${m.name} x${ci.qty}`, description: ci.customization || '' };
+    }),
+  ];
+  await sendInteractiveList(to, 'Remove from Cart', 'Select an item to remove:', 'Your Items', rows, 'Show Options');
 }
 
-// ===== Address helpers =====
+// ============ Address helpers ============
 async function getUserProfile(userId) {
   const doc = await db.collection('users').doc(userId).get();
   return doc.exists ? doc.data() : {};
 }
-async function saveUserAddress(userId, address) {
-  await db.collection('users').doc(userId).set({ address, addressUpdatedAt: Date.now() }, { merge: true });
+function getDefaultAddress(profile) {
+  if (!profile) return null;
+  if (Array.isArray(profile.addresses) && profile.addresses.length) {
+    return profile.addresses.find((a) => a.isDefault) || profile.addresses[0];
+  }
+  if (profile.address) return { address: profile.address, isDefault: true, id: 'default' };
+  return null;
 }
-// Simple validator
-function isValidAddress(str) {
-  if (!str) return false;
-  const s = String(str).trim();
-  return s.length >= 8; // very basic length check
+async function saveUserAddress(userId, address) {
+  const ref = db.collection('users').doc(userId);
+  const snap = await ref.get();
+  const data = snap.exists ? snap.data() : {};
+  let addresses = Array.isArray(data.addresses) ? data.addresses : [];
+  if (!addresses.length) {
+    addresses = [{ id: 'default', label: 'Default', address: String(address), isDefault: true }];
+  } else {
+    addresses = addresses.map((a) => (a.isDefault ? { ...a, address: String(address) } : a));
+  }
+  await ref.set({ addresses, address: String(address), updatedAt: nowIso() }, { merge: true });
 }
 
-// ===== Live video link builder =====
+// ============ Coupons/Loyalty ============
+async function fetchActivePromos() {
+  const snap = await db.collection('promos').where('active', '==', true).get();
+  return snap.docs.map((d) => ({ id: d.id, ...d.data() }));
+}
+async function fetchActivePromoByCode(code) {
+  const promoCode = String(code || '').trim().toUpperCase();
+  if (!promoCode) return null;
+  const snap = await db.collection('promos').where('code', '==', promoCode).where('active', '==', true).limit(1).get();
+  if (snap.empty) return null;
+  return { id: snap.docs[0].id, ...snap.docs[0].data() };
+}
+async function sendCouponsPicker(to) {
+  const promos = await fetchActivePromos();
+  if (!promos.length) {
+    await safeSend(to, 'No coupons available right now.');
+    await sendHome(to, 'Choose next action:');
+    return;
+  }
+  const rows = promos.map((p) => ({
+    id: `coupon:${p.code}`,
+    title: `${p.code} — ${p.percent}% OFF`,
+    description: p.description || '',
+  }));
+  await sendInteractiveList(to, 'Coupons', 'Select a coupon to apply:', 'Available Coupons', rows, 'Show Options');
+}
+
+// ============ Payments ============
 function buildLiveUrl(orderId, userId) {
-  // Keep simple. If you add auth later, append a signed token.
   return `${LIVE_BASE}?order=${encodeURIComponent(orderId)}&u=${encodeURIComponent(userId)}`;
 }
-
-// Helper: safely get latest order for a user (with index fallback)
-async function getLatestOrderForUser(userId) {
-  try {
-    const snap = await db
-      .collection('orders')
-      .where('userId', '==', userId)
-      .orderBy('createdAt', 'desc')
-      .limit(1)
-      .get();
-    if (snap.empty) return null;
-    const doc = snap.docs[0];
-    return { id: doc.id, data: doc.data(), ref: doc.ref };
-  } catch (e) {
-    const msg = String(e?.message || '');
-    if (e?.code === 9 || msg.includes('index') || msg.toLowerCase().includes('failed_precondition')) {
-      const snap = await db.collection('orders').where('userId', '==', userId).get();
-      if (snap.empty) return null;
-      let latestDoc = null;
-      snap.forEach((d) => {
-        if (!latestDoc) latestDoc = d;
-        else {
-          const a = d.data()?.createdAt || 0;
-          const b = latestDoc.data()?.createdAt || 0;
-          if (a > b) latestDoc = d;
-        }
-      });
-      return latestDoc ? { id: latestDoc.id, data: latestDoc.data(), ref: latestDoc.ref } : null;
-    }
-    throw e;
+async function sendPaymentButtons(to, orderId) {
+  await sendButtons(to, 'Choose a payment method:', [
+    { id: `pay_upi:${orderId}`, title: 'UPI' },
+    { id: `pay_razor:${orderId}`, title: 'Razorpay' },
+    { id: `pay_cod:${orderId}`, title: 'COD' },
+  ]);
+}
+async function markOrderPaidAndNotify(orderId, userId) {
+  const ref = db.collection('orders').doc(orderId);
+  const doc = await ref.get();
+  if (!doc.exists) {
+    await safeSend(userId, 'Order not found.');
+    return;
   }
+  const o = doc.data();
+  const now = nowIso();
+  await ref.set(
+    {
+      status: 'confirmed',
+      paidAt: now,
+      payment: { ...(o.payment || {}), status: 'paid' },
+      updatedAt: now,
+      statusHistory: [ ...(o.statusHistory || []), { status: 'confirmed', at: now } ],
+    },
+    { merge: true }
+  );
+  await safeSend(userId, '✅ Payment received! Your order is confirmed.');
+  await safeSend(userId, `🎥 Live kitchen:\n${buildLiveUrl(orderId, userId)}`);
+  await sendHome(userId, 'You can track your order or do more:');
+}
+async function notifyAdmin(text) {
+  if (!OWNER_WA_NUMBER) return;
+  await safeSend(OWNER_WA_NUMBER, text);
 }
 
-async function clearExpiredSessions() {
-  const sessionSnapshot = await db.collection('sessions').get();
-  const now = Date.now();
-  const timeoutMinutes = parseInt(process.env.SESSION_TIMEOUT_MINUTES || '30', 10);
-  sessionSnapshot.forEach(async (doc) => {
-    const s = doc.data();
-    if (s.updatedAt && now - s.updatedAt > timeoutMinutes * 60 * 1000) {
-      await doc.ref.delete();
-    }
+// ============ Checkout flow ============
+async function startCheckoutFlow(userId) {
+  const cart = await getCart(userId);
+  const items = cart.items || [];
+  if (!items.length) {
+    await safeSend(userId, 'Your cart is empty.');
+    await sendHome(userId, 'Choose an option:');
+    return;
+  }
+
+  const profile = await getUserProfile(userId);
+  const def = getDefaultAddress(profile);
+  if (!def?.address) {
+    await safeSend(userId, '📍 Please send your full delivery address in a single message.');
+    await db.collection('sessions').doc(userId).set({ step: 'collecting_address', updatedAt: Date.now() }, { merge: true });
+    return;
+  }
+
+  // Compute totals
+  const menuDocs = await Promise.all(items.map((ci) => db.collection('menu').doc(ci.itemId).get()));
+  let baseTotal = 0;
+  items.forEach((ci, idx) => {
+    const m = menuDocs[idx].exists ? menuDocs[idx].data() : { price: 0 };
+    baseTotal += (m.price || 0) * (ci.qty || 1);
   });
+
+  // Apply coupon if single available
+  const sessionRef = db.collection('sessions').doc(userId);
+  const sSnap = await sessionRef.get();
+  let session = sSnap.exists ? sSnap.data() : {};
+  let finalTotal = baseTotal;
+
+  if (!session.coupon) {
+    const promos = await fetchActivePromos();
+    if (promos.length === 1) {
+      const p = promos[0];
+      session.coupon = { code: p.code, percent: p.percent };
+      await sessionRef.set({ ...session, updatedAt: Date.now() });
+      await safeSend(userId, `🎉 Auto-applied coupon: ${p.code} (${p.percent}% OFF)`);
+      finalTotal -= Math.round(finalTotal * (p.percent / 100));
+    } else if (promos.length > 1) {
+      await sendCouponsPicker(userId);
+      return;
+    }
+  } else {
+    finalTotal -= Math.round(finalTotal * (Number(session.coupon.percent || 0) / 100));
+  }
+
+  const now = nowIso();
+  const orderId = uuidv4();
+  await db.collection('orders').doc(orderId).set({
+    userId,
+    items,
+    totals: { baseTotal, promo: session.coupon || null, finalTotal },
+    total: finalTotal,
+    payment: { method: 'unknown', status: 'pending' },
+    status: 'pending_payment',
+    statusHistory: [{ status: 'pending_payment', at: now }],
+    deliveryAddress: def.address || '',
+    createdAt: now,
+    updatedAt: now,
+  });
+
+  await setCart(userId, { items: [] });
+
+  await safeSend(userId, `Order created (ID: ${orderId}). Total: ₹${finalTotal}`);
+  await notifyAdmin(`🆕 New Order\nID: ${orderId}\nFrom: ${userId}\nTotal: ₹${finalTotal}`);
+
+  await sendPaymentButtons(userId, orderId);
+  await sendHome(userId, 'You can always open Show Options:');
 }
 
+// ============ Main incoming handler ============
 async function handleIncoming(payload) {
   const entry = payload?.entry?.[0]?.changes?.[0]?.value;
   if (!entry?.messages) return;
 
   const message = entry.messages[0];
   const from = message.from;
-  const text = message.text?.body?.trim() || '';
-  const lowerText = text.toLowerCase();
+  const type = message.type;
+  const text = type === 'text' ? (message.text?.body?.trim() || '') : '';
+  const lower = text.toLowerCase();
 
+  // Exit keywords
+  if (['bye', 'stop', 'exit'].includes(lower)) {
+    await safeSend(from, 'Thanks! Message anytime to order again.');
+    return;
+  }
+
+  // Location handling
+  if (type === 'location') {
+    const loc = message.location || {};
+    await db.collection('users').doc(from).set(
+      { lastLocation: { lat: loc.latitude, lng: loc.longitude, name: loc.name || '', address: loc.address || '' }, updatedAt: nowIso() },
+      { merge: true }
+    );
+    await safeSend(from, '📍 Location saved for delivery.');
+    await sendHome(from, 'What would you like to do next?');
+    return;
+  }
+
+  // Sessions
   const sessionRef = db.collection('sessions').doc(from);
-  let sessionSnapshot = await sessionRef.get();
-  let session = sessionSnapshot.exists ? sessionSnapshot.data() : {};
+  const sSnap = await sessionRef.get();
+  let session = sSnap.exists ? sSnap.data() : {};
   if (!session.updatedAt) session.updatedAt = Date.now();
-  if (!session.lastMessageAt) session.lastMessageAt = 0;
 
-  // Allow payment/address/interactive to bypass flood control
-  const isBypass = lowerText === 'paid' || message.type === 'interactive' || session.step?.startsWith('collecting_address') || session.step === 'confirming_address';
-  if (!isBypass && Date.now() - session.lastMessageAt < 1000) {
-    await sendMessage(from, '⏳ Please slow down.');
-    return;
-  }
-  session.lastMessageAt = Date.now();
+  // Handle interactive list replies
+  if (type === 'interactive' && message.interactive?.type === 'list_reply') {
+    const id = message.interactive.list_reply?.id || '';
 
-  // 1) Interactive replies
-  if (message.type === 'interactive') {
-    const type = message.interactive?.type;
+    // Home actions
+    if (id.startsWith('home:')) {
+      const key = id.split(':')[1];
 
-    // a) List reply -> add selected menu item
-    if (type === 'list_reply') {
-      const row = message.interactive?.list_reply;
-      const itemId = row?.id;
-      try {
-        if (!itemId) throw new Error('Invalid selection');
-        const mDoc = await db.collection('menu').doc(itemId).get();
-        if (!mDoc.exists) throw new Error('Menu item not found');
-        const m = mDoc.data();
-        if (m.available === false) throw new Error('Item out of stock');
-
-        const cartRef = db.collection('carts').doc(from);
-        const cSnap = await cartRef.get();
-        const cart = cSnap.exists ? cSnap.data() : { items: [] };
-        const existing = cart.items.find((i) => i.itemId === itemId);
-        if (existing) existing.qty = (existing.qty || 1) + 1;
-        else cart.items.push({ itemId, qty: 1, customization: '' });
-        await cartRef.set(cart);
-
-        await sendMessage(from, `✅ Added ${m.name} to your cart.`);
-        await buildAndSendCartSummary(from);
-
-        session.step = '';
-        await sessionRef.set({ ...session, updatedAt: Date.now() });
-      } catch (e) {
-        await sendMessage(from, `Sorry, couldn't add item: ${e.message}`);
+      if (key === 'menu') {
+        await sendMenuList(from);
+        return;
       }
-      return;
-    }
-
-    // b) Button reply -> confirm/cancel order
-    if (type === 'button_reply') {
-      const replyId = message.interactive?.button_reply?.id || '';
-      try {
-        if (replyId.startsWith('confirm_')) {
-          const orderId = replyId.replace('confirm_', '');
-          // Create order from current cart
-          const cartDoc = await db.collection('carts').doc(from).get();
-          const items = cartDoc.exists ? cartDoc.data().items : [];
-          if (!items.length) {
-            await sendMessage(from, 'Your cart is empty. Please add items before confirming.');
-            return;
-          }
-          // Need address
-          const profile = await getUserProfile(from);
-          if (!profile.address) {
-            await sendMessage(from, '📍 Please share your delivery address before we confirm. Send your full address in one message.');
-            session.step = 'collecting_address';
-            session.afterAddressAction = 'confirm_existing_order';
-            session.pendingOrderId = orderId;
-            await sessionRef.set({ ...session, updatedAt: Date.now() });
-            return;
-          }
-
-          let total = 0;
-          for (const ci of items) {
-            const mi = await db.collection('menu').doc(ci.itemId).get();
-            if (mi.exists) total += (mi.data().price || 0) * (ci.qty || 1);
-          }
-          const finalTotal = session.orderTotal || total;
-
-          const order = {
-            userId: from,
-            items,
-            total: finalTotal,
-            status: 'pending_payment',
-            createdAt: Date.now(),
-            scheduledFor: session.scheduledFor || null,
-            deliveryAddress: profile.address || '',
-          };
-          await db.collection('orders').doc(orderId).set(order);
-
-          await db.collection('carts').doc(from).set({ items: [] });
-
-          await sendMessage(from, `Please pay: https://your-payment-link.com/pay?order=${orderId}`);
-          await sendMessage(from, `Once paid, reply "paid" to confirm or wait for auto-verification.`);
-
-          session.step = '';
-          delete session.pendingOrderId;
-          await sessionRef.set({ ...session, updatedAt: Date.now() });
-        } else if (replyId.startsWith('cancel_') || replyId === 'cancel') {
-          session.step = '';
-          delete session.orderId;
-          delete session.orderTotal;
-          await sessionRef.set({ ...session, updatedAt: Date.now() });
-          await sendMessage(from, 'Order cancelled. You can type 1 to see the menu again.');
+      if (key === 'cart') {
+        await sendCartSummary(from);
+        await sendRemoveFromCartList(from);
+        return;
+      }
+      if (key === 'checkout') {
+        await startCheckoutFlow(from);
+        return;
+      }
+      if (key === 'track') {
+        await handleTrack(from, true);
+        return;
+      }
+      if (key === 'address') {
+        const profile = await getUserProfile(from);
+        const def = getDefaultAddress(profile);
+        if (def?.address) {
+          await safeSend(from, `Your default address:\n${def.address}\n\nSend a new address to update.`);
         } else {
-          await sendMessage(from, 'Not sure what you selected. Type 1 for menu.');
+          await safeSend(from, '📍 Please send your full delivery address in one message.\nExample: "House 12, MG Road, Indore 452001"');
         }
-      } catch (e) {
-        console.error('[Button Reply Error]', e);
-        await sendMessage(from, `Something went wrong: ${e.message}`);
+        await sessionRef.set({ ...session, step: 'collecting_address', updatedAt: Date.now() });
+        await sendHome(from, 'You can continue from Show Options meanwhile.');
+        return;
       }
-      return;
-    }
-  }
-
-  // 2) Address commands (view/change)
-  if (lowerText === 'address' || lowerText.includes('change address') || lowerText.startsWith('set address')) {
-    const profile = await getUserProfile(from);
-    if (profile.address) {
-      await sendMessage(from, `Your current address:\n${profile.address}\n\nSend a new address to update it.`);
-    } else {
-      await sendMessage(from, '📍 Please send your full delivery address in one message.\nExample: "House 12, MG Road, Indore, 452001"');
-    }
-    session.step = 'collecting_address';
-    session.afterAddressAction = ''; // standalone update
-    await sessionRef.set({ ...session, updatedAt: Date.now() });
-    return;
-  }
-
-  // 3) Address collection flow
-  if (session.step === 'collecting_address' && message.type === 'text') {
-    const addr = text;
-    if (!isValidAddress(addr)) {
-      await sendMessage(from, 'Address looks too short. Please send full address with house no, street, city, pincode.');
-      return;
-    }
-    session.tempAddress = addr;
-    session.step = 'confirming_address';
-    await sessionRef.set({ ...session, updatedAt: Date.now() });
-    await sendMessage(from, `Please confirm this address:\n${addr}\nReply "yes" to save or "no" to re-enter.`);
-    return;
-  }
-  if (session.step === 'confirming_address') {
-    if (lowerText.startsWith('yes')) {
-      const addr = session.tempAddress;
-      await saveUserAddress(from, addr);
-      await sendMessage(from, '✅ Address saved.');
-      // Continue any pending action
-      const next = session.afterAddressAction || '';
-      const pendingTotal = session.pendingTotal || null;
-      const pendingOrderId = session.pendingOrderId || null;
-      session.step = '';
-      delete session.tempAddress;
-      delete session.afterAddressAction;
-      delete session.pendingTotal;
-      delete session.pendingOrderId;
-      await sessionRef.set({ ...session, updatedAt: Date.now() });
-
-      if (next === 'place_order') {
-        // Resume place order flow
-        const cartDoc = await db.collection('carts').doc(from).get();
-        const items = cartDoc.exists ? cartDoc.data().items : [];
-        if (!items.length) {
-          await sendMessage(from, 'Your cart is empty. Add items before placing order.');
+      if (key === 'coupons') {
+        await sendCouponsPicker(from);
+        return;
+      }
+      if (key === 'points') {
+        const u = await db.collection('users').doc(from).get();
+        const points = Number(u.exists ? (u.data()?.loyalty?.points || 0) : 0);
+        await safeSend(from, `⭐ Your loyalty points: ${points}`);
+        await sendHome(from, 'What next?');
+        return;
+      }
+      if (key === 'reorder') {
+        await handleReorder(from);
+        return;
+      }
+      if (key === 'subscribe') {
+        const cart = await getCart(from);
+        if (!cart.items?.length) {
+          await safeSend(from, 'Your cart is empty. Add items first.');
+          await sendMenuList(from);
           return;
         }
-        let total = 0;
-        for (const ci of items) {
-          const mi = await db.collection('menu').doc(ci.itemId).get();
-          if (mi.exists) total += (mi.data().price || 0) * (ci.qty || 1);
-        }
-        const totalToUse = pendingTotal || total;
-        const orderId = uuidv4();
-        // Save session for confirmation buttons
-        const s2 = (await sessionRef.get()).data() || {};
-        s2.step = 'confirming_order';
-        s2.orderId = orderId;
-        s2.orderTotal = totalToUse;
-        await sessionRef.set({ ...s2, updatedAt: Date.now() });
-        await sendOrderConfirmationButtons(from, orderId, totalToUse);
+        const now = nowIso();
+        const r = await db.collection('subscriptions').add({
+          userId: from, plan: 'weekly', items: cart.items, startDate: now.slice(0, 10), status: 'active', notes: '', createdAt: now, updatedAt: now,
+        });
+        await safeSend(from, `✅ Weekly subscription created. ID: ${r.id}`);
+        await sendHome(from, 'Choose your next action:');
         return;
       }
-      if (next === 'confirm_existing_order' && pendingOrderId) {
-        // User pressed Yes earlier; now address is saved, instruct to press 4 again
-        await sendMessage(from, 'Now press 4 again to continue order confirmation.');
+      if (key === 'support') {
+        await db.collection('support').add({
+          userId: from, message: 'Agent requested', status: 'open', createdAt: nowIso(), updatedAt: nowIso(),
+        });
+        await safeSend(from, 'A human agent will reach out to you soon.');
+        await notifyAdmin(`🚨 Agent requested by ${from}`);
+        await sendHome(from, 'Meanwhile, you can continue:');
         return;
       }
-      return;
     }
-    if (lowerText.startsWith('no')) {
-      session.step = 'collecting_address';
-      await sessionRef.set({ ...session, updatedAt: Date.now() });
-      await sendMessage(from, 'Okay, please send the correct address.');
-      return;
-    }
-    // If neither yes/no, nudge
-    await sendMessage(from, 'Please reply "yes" to save this address or "no" to change it.');
-    return;
-  }
 
-  // 4) NLP-lite add flow
-  if (/i want|add|order|with|without/.test(lowerText)) {
-    const { item, qty, customization } = extractOrderIntent(lowerText);
-    if (item) {
-      const itemsSnap = await db.collection('menu').where('available', '==', true).get();
-      let found;
-      itemsSnap.forEach((doc) => {
-        if (doc.data().name?.toLowerCase() === item) found = doc;
-      });
-      if (!found) {
-        await sendMessage(from, `Sorry, couldn't find "${item}" in menu. Reply "menu" for options.`);
+    // Menu multi-add
+    if (id.startsWith('menu:')) {
+      const item = id.split(':')[1];
+      if (item === 'done') {
+        await safeSend(from, 'Great! You can checkout now.');
+        await sendHome(from, 'Open Show Options to continue:');
         return;
       }
-      const menuDoc = found.data();
-      const customizations = menuDoc.customizations || [];
-      if (customizations.length && !customization) {
-        await sendMessage(from, `Would you like any of the following customizations: ${customizations.join(', ')}? Reply as "with <customization>".`);
-        session.step = 'waiting_for_customization';
-        session.tempItemId = found.id;
-        session.qty = qty;
-        await sessionRef.set({ ...session, updatedAt: Date.now() });
+      const mDoc = await db.collection('menu').doc(item).get();
+      if (!mDoc.exists) {
+        await safeSend(from, 'Item not found.');
+        await sendMenuList(from);
         return;
       }
-      const cartRef = db.collection('carts').doc(from);
-      const cartSnap = await cartRef.get();
-      const cart = cartSnap.exists ? cartSnap.data() : { items: [] };
-      cart.items.push({
-        itemId: found.id,
-        qty,
-        customization: customization || '',
-      });
-      await cartRef.set(cart);
-      await sendMessage(from, `✅ Added ${qty} x ${menuDoc.name}${customization ? ' with ' + customization : ''} to your cart!\nReply:\n1 - Show Menu\n2 - Show Cart\n4 - Place Order\nType "address" to set delivery address.`);
-      session.step = '';
-      await sessionRef.set({ ...session, updatedAt: Date.now() });
-      return;
-    }
-  }
-
-  if (session.step === 'waiting_for_customization' && session.tempItemId && lowerText.startsWith('with')) {
-    const customization = lowerText.replace(/^with\s+/, '');
-    const cartRef = db.collection('carts').doc(from);
-    const cartSnap = await cartRef.get();
-    const cart = cartSnap.exists ? cartSnap.data() : { items: [] };
-    cart.items.push({
-      itemId: session.tempItemId,
-      qty: session.qty || 1,
-      customization,
-    });
-    await cartRef.set(cart);
-    await sendMessage(from, `✅ Added to your cart with customization: ${customization}\nReply:\n1 - Show Menu\n2 - Show Cart\n4 - Place Order`);
-    session.step = '';
-    delete session.tempItemId;
-    delete session.qty;
-    await sessionRef.set({ ...session, updatedAt: Date.now() });
-    return;
-  }
-
-  // 5) Menu
-  if (lowerText === '1' || lowerText === 'menu') {
-    const snapshot = await db.collection('menu').where('available', '==', true).get();
-    const menu = [];
-    snapshot.forEach((doc) => menu.push({ id: doc.id, ...doc.data() }));
-    if (!menu.length) {
-      await sendMessage(from, 'Menu is empty right now. Please try later.');
-    } else {
-      await sendMenuList(from, menu);
-    }
-    session.step = '';
-    await sessionRef.set({ ...session, updatedAt: Date.now() });
-    return;
-  }
-
-  // 6) Cart
-  if (lowerText === '2' || lowerText.includes('cart')) {
-    await buildAndSendCartSummary(from);
-    session.step = '';
-    await sessionRef.set({ ...session, updatedAt: Date.now() });
-    return;
-  }
-
-  // 7) Place order (requires address)
-  if (lowerText === '4' || lowerText.includes('place order')) {
-    const cartDoc = await db.collection('carts').doc(from).get();
-    const items = cartDoc.exists ? cartDoc.data().items : [];
-    if (!items.length) {
-      await sendMessage(from, 'Your cart is empty. Add items before placing order.');
-      return;
-    }
-    // Address check
-    const profile = await getUserProfile(from);
-    if (!profile.address) {
-      await sendMessage(from, '📍 We need your delivery address first.\nPlease send your full address in one message.');
-      session.step = 'collecting_address';
-      session.afterAddressAction = 'place_order';
-      // compute total now and keep
-      let total = 0;
-      for (const ci of items) {
-        const mi = await db.collection('menu').doc(ci.itemId).get();
-        if (mi.exists) total += (mi.data().price || 0) * (ci.qty || 1);
-      }
-      // Apply promo (optional, after address we’ll reuse this)
-      const activePromo = await db.collection('promos').where('active', '==', true).limit(1).get();
-      if (!activePromo.empty) {
-        const promo = activePromo.docs[0].data();
-        const discount = Math.round(total * (promo.percent / 100));
-        total -= discount;
-        await sendPromoCode(from, promo.code, `${promo.percent}% OFF (auto-applied)`);
-      }
-      session.pendingTotal = total;
-      await sessionRef.set({ ...session, updatedAt: Date.now() });
-      return;
-    }
-
-    // Compute total + promo
-    let total = 0;
-    for (const ci of items) {
-      const mi = await db.collection('menu').doc(ci.itemId).get();
-      if (mi.exists) total += (mi.data().price || 0) * (ci.qty || 1);
-    }
-    const activePromo = await db.collection('promos').where('active', '==', true).limit(1).get();
-    if (!activePromo.empty) {
-      const promo = activePromo.docs[0].data();
-      const discount = Math.round(total * (promo.percent / 100));
-      total -= discount;
-      await sendPromoCode(from, promo.code, `${promo.percent}% OFF (auto-applied)`);
-    }
-    const orderId = uuidv4();
-    session.step = 'confirming_order';
-    session.orderId = orderId;
-    session.orderTotal = total;
-    await sessionRef.set({ ...session, updatedAt: Date.now() });
-    await sendOrderConfirmationButtons(from, orderId, total);
-    return;
-  }
-
-  // 8) Fallback text "yes" confirm
-  if (session.step === 'confirming_order' && lowerText.startsWith('yes')) {
-    const profile = await getUserProfile(from);
-    if (!profile.address) {
-      await sendMessage(from, '📍 Please share your delivery address before we confirm the order.');
-      session.step = 'collecting_address';
-      session.afterAddressAction = 'confirm_existing_order';
-      session.pendingOrderId = session.orderId;
-      await sessionRef.set({ ...session, updatedAt: Date.now() });
-      return;
-    }
-
-    const cartDoc = await db.collection('carts').doc(from).get();
-    const items = cartDoc.exists ? cartDoc.data().items : [];
-    const order = {
-      userId: from,
-      items,
-      total: session.orderTotal,
-      status: 'pending_payment',
-      createdAt: Date.now(),
-      scheduledFor: session.scheduledFor || null,
-      deliveryAddress: profile.address || '',
-    };
-    await db.collection('orders').doc(session.orderId).set(order);
-    await db.collection('carts').doc(from).set({ items: [] });
-    await sendMessage(from, `Please pay: https://your-payment-link.com/pay?order=${session.orderId}`);
-    await sendMessage(from, `Once paid, reply "paid" to confirm or wait for auto-verification.`);
-    session.step = '';
-    await sessionRef.set({ ...session, updatedAt: Date.now() });
-    return;
-  }
-
-  // 9) Payment simulation
-  if (/\bpaid\b/.test(lowerText)) {
-    try {
-      const latest = await getLatestOrderForUser(from);
-      if (latest) {
-        await latest.ref.update({ status: 'confirmed', paidAt: Date.now() });
-        await sendMessage(from, `✅ Payment received! Your order is confirmed. We'll notify you when it's out for delivery.`);
-        // Live video link
-        const liveUrl = buildLiveUrl(latest.id, from);
-        await sendMessage(from, `🎥 Watch your food being prepared live:\n${liveUrl}`);
-        await sendPromoCode(from, 'NEXT10', '10% OFF your next order');
-      } else {
-        await sendMessage(from, 'No recent orders found.');
-      }
-    } catch (e) {
-      console.error('[Paid Handler Error]', e);
-      await sendMessage(from, 'We could not verify payment right now. Please try again in a moment.');
-    }
-    return;
-  }
-
-  // 10) Live video request (manual)
-  if (/live\s*video|preparation\s*video|show\s*(me\s*)?video|camera/.test(lowerText)) {
-    const latest = await getLatestOrderForUser(from);
-    if (!latest) {
-      await sendMessage(from, "You don't have any recent orders eligible for live preparation video.");
-      return;
-    }
-    const liveUrl = buildLiveUrl(latest.id, from);
-    await sendMessage(from, `🎥 Live kitchen:\n${liveUrl}`);
-    return;
-  }
-
-  // 11) Scheduling
-  if (/deliver at|schedule for|at \d/.test(lowerText)) {
-    const match = lowerText.match(/at (\d{1,2}(:\d{2})?\s*(am|pm)?)/);
-    if (match) {
-      session.scheduledFor = match[1];
-      await sendMessage(from, `Order will be scheduled for delivery at ${match[1]}. Proceed to checkout.`);
-      await sessionRef.set({ ...session, updatedAt: Date.now() });
-      return;
-    }
-  }
-
-  // 12) Tracking (3 or text)
-  if (/track|status|where.*order/.test(lowerText) || lowerText === '3') {
-    try {
-      const latest = await getLatestOrderForUser(from);
-      if (latest) {
-        const o = latest.data;
-        await sendMessage(from, `Order #${latest.id.slice(-5)} status: ${o.status}\nTotal: ₹${o.total}\nAddress: ${o.deliveryAddress || '-'}`);
-      } else {
-        await sendMessage(from, 'No recent orders found.');
-      }
-    } catch (e) {
-      console.error('[Track Handler Error]', e);
-      await sendMessage(from, 'Unable to get order status right now. Please try again.');
-    }
-    return;
-  }
-
-  // 13) Recent orders list (keyword "order")
-  if (lowerText.includes('order')) {
-    const orders = await db
-      .collection('orders')
-      .where('userId', '==', from)
-      .orderBy('createdAt', 'desc')
-      .limit(3)
-      .get()
-      .catch(async (e) => {
-        const msg = String(e?.message || '');
-        if (e?.code === 9 || msg.includes('index') || msg.toLowerCase().includes('failed_precondition')) {
-          const s = await db.collection('orders').where('userId', '==', from).get();
-          const arr = s.docs
-            .map((d) => ({ id: d.id, ...d.data() }))
-            .sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0))
-            .slice(0, 3);
-          return { fallback: true, docs: arr };
-        }
-        throw e;
-      });
-
-    if (!orders) {
-      await sendMessage(from, 'No orders yet. Reply "menu" to see menu.');
-      return;
-    }
-
-    if (orders.fallback) {
-      if (!orders.docs.length) {
-        await sendMessage(from, 'No orders yet. Reply "menu" to see menu.');
+      const m = mDoc.data();
+      if (m.available === false) {
+        await safeSend(from, 'Item is out of stock.');
+        await sendMenuList(from);
         return;
       }
-      let msg = '🧾 Your Recent Orders\n\n';
-      orders.docs.forEach((o) => {
-        msg += `Order #${String(o.id).slice(-5)} — Status: ${o.status}\nTotal: ₹${o.total || '-'}\nAddress: ${o.deliveryAddress || '-'}\n\n`;
-      });
-      await sendMessage(from, msg);
+      const cart = await getCart(from);
+      const ex = (cart.items || []).find((i) => i.itemId === item);
+      if (ex) ex.qty = (ex.qty || 1) + 1;
+      else (cart.items = cart.items || []).push({ itemId: item, qty: 1, customization: '' });
+      await setCart(from, cart);
+      await safeSend(from, `✅ Added ${m.name} to your cart.`);
+      await sendMenuList(from); // re-open for multi-add
       return;
     }
 
-    if (orders.empty) {
-      await sendMessage(from, 'No orders yet. Reply "menu" to see menu.');
+    // Coupon selected
+    if (id.startsWith('coupon:')) {
+      const code = id.split(':')[1];
+      const promo = await fetchActivePromoByCode(code);
+      if (!promo) {
+        await safeSend(from, 'Invalid or inactive coupon.');
+        await sendHome(from, 'Choose next action:');
+        return;
+      }
+      session.coupon = { code: promo.code, percent: promo.percent };
+      await sessionRef.set({ ...session, updatedAt: Date.now() });
+      await safeSend(from, `✅ Coupon applied: ${promo.code} (${promo.percent}% OFF).`);
+      await sendHome(from, 'Proceed to checkout or continue shopping:');
       return;
     }
-    let msg = '🧾 Your Recent Orders\n\n';
-    orders.forEach((doc) => {
+
+    // Remove from cart
+    if (id.startsWith('remove:')) {
+      const idxStr = id.split(':')[1];
+      if (idxStr === 'done') {
+        await safeSend(from, 'Done removing.');
+        await sendCartSummary(from);
+        await sendHome(from, 'What next?');
+        return;
+      }
+      const i = parseInt(idxStr, 10);
+      const cart = await getCart(from);
+      const items = cart.items || [];
+      if (Number.isFinite(i) && items[i]) {
+        items.splice(i, 1);
+        await setCart(from, { items });
+        await safeSend(from, 'Item removed.');
+        await sendRemoveFromCartList(from); // allow removing more
+        return;
+      }
+      await safeSend(from, 'Invalid selection.');
+      await sendCartSummary(from);
+      await sendHome(from, 'Choose next action:');
+      return;
+    }
+
+    // Fallback to home
+    await sendHome(from);
+    return;
+  }
+
+  // Handle interactive button replies (payments + address confirm)
+  if (type === 'interactive' && message.interactive?.type === 'button_reply') {
+    const id = message.interactive.button_reply?.id || '';
+
+    // Address confirm buttons
+    if (id === 'addr_save' || id === 'addr_edit') {
+      const s = await sessionRef.get();
+      const sess = s.exists ? s.data() : {};
+      const temp = sess.tempAddress || '';
+      if (id === 'addr_save' && temp) {
+        await saveUserAddress(from, temp);
+        await sessionRef.set({ step: '', tempAddress: '', updatedAt: Date.now() }, { merge: true });
+        await safeSend(from, '✅ Address saved.');
+        await sendHome(from, 'What would you like to do next?');
+        return;
+      }
+      // edit
+      await sessionRef.set({ ...sess, step: 'collecting_address', tempAddress: '', updatedAt: Date.now() });
+      await safeSend(from, 'Okay, please send your full address again.\nExample: "House 12, MG Road, Indore 452001"');
+      await sendHome(from, 'You can continue other things meanwhile:');
+      return;
+    }
+
+    // Payments
+    if (id.startsWith('pay_upi:')) {
+      const orderId = id.split(':')[1];
+      const o = await db.collection('orders').doc(orderId).get();
+      if (!o.exists) {
+        await safeSend(from, 'Order not found.');
+        await sendHome(from, 'Choose next action:');
+        return;
+      }
+      const data = o.data();
+      const amount = Number(data?.totals?.finalTotal ?? data?.total ?? 0);
+      const upi = `upi://pay?pa=merchant@upi&pn=CloudKitchen&am=${amount}&tn=Order%20${orderId}`;
+      await safeSend(from, `UPI Link:\n${upi}\nOpen this link in your UPI app to pay.`);
+      await sendButtons(from, 'When done:', [
+        { id: `mark_paid:${orderId}`, title: 'I’ve paid' },
+        { id: 'home:track', title: 'Track' },
+        { id: 'home:support', title: 'Support' },
+      ]);
+      return;
+    }
+    if (id.startsWith('pay_razor:')) {
+      const orderId = id.split(':')[1];
+      const ref = db.collection('orders').doc(orderId);
+      const doc = await ref.get();
+      if (!doc.exists) {
+        await safeSend(from, 'Order not found.');
+        await sendHome(from, 'Choose next action:');
+        return;
+      }
+      const razorpayOrderId = 'razor_' + Math.random().toString(36).slice(2, 12);
+      await ref.set(
+        {
+          payment: { ...(doc.data().payment || {}), method: 'Razorpay', status: 'pending', razorpayOrderId },
+          status: 'pending_payment',
+          updatedAt: nowIso(),
+        },
+        { merge: true }
+      );
+      await safeSend(from, `Razorpay Order ID: ${razorpayOrderId}\n(After real integration, payment confirmation will be automatic.)`);
+      await sendButtons(from, 'When done:', [
+        { id: `mark_paid:${orderId}`, title: 'I’ve paid' },
+        { id: 'home:track', title: 'Track' },
+        { id: 'home:support', title: 'Support' },
+      ]);
+      return;
+    }
+    if (id.startsWith('pay_cod:')) {
+      const orderId = id.split(':')[1];
+      const ref = db.collection('orders').doc(orderId);
+      const doc = await ref.get();
+      if (!doc.exists) {
+        await safeSend(from, 'Order not found.');
+        await sendHome(from, 'Choose next action:');
+        return;
+      }
       const o = doc.data();
-      msg += `Order #${doc.id.slice(-5)} — Status: ${o.status}\nTotal: ₹${o.total || '-'}\nAddress: ${o.deliveryAddress || '-'}\n\n`;
-    });
-    await sendMessage(from, msg);
+      const now = nowIso();
+      await ref.set(
+        {
+          payment: { ...(o.payment || {}), method: 'COD', status: 'pending' },
+          status: 'confirmed',
+          updatedAt: now,
+          statusHistory: [ ...(o.statusHistory || []), { status: 'confirmed', at: now } ],
+        },
+        { merge: true }
+      );
+      await safeSend(from, '✅ COD selected. Your order is confirmed!');
+      await safeSend(from, `🎥 Live kitchen:\n${buildLiveUrl(orderId, from)}`);
+      await notifyAdmin(`🆕 COD Confirmed\nID: ${orderId}\nFrom: ${from}\nTotal: ₹${Number(o?.totals?.finalTotal ?? o?.total ?? 0)}`);
+      await sendHome(from, 'You can track your order or do more:');
+      return;
+    }
+    if (id.startsWith('mark_paid:')) {
+      const orderId = id.split(':')[1];
+      await markOrderPaidAndNotify(orderId, from);
+      return;
+    }
+
+    // If button maps to home action
+    if (id.startsWith('home:')) {
+      await handleIncoming({
+        entry: [{ changes: [{ value: { messages: [{ from, type: 'interactive', interactive: { type: 'list_reply', list_reply: { id } } }] }}]}]},
+      });
+      return;
+    }
+
+    await sendHome(from);
     return;
   }
 
-  // 14) Help
-  if (lowerText === '5' || lowerText.includes('help') || lowerText.includes('support')) {
-    await sendMessage(
-      from,
-      `How can we help?\n- Type 1: Menu\n- Type 2: Cart\n- Type 3: Track Order\n- Type 4: Place Order\n- Type "address": View/Change address\n- Type "video": Live kitchen link`
-    );
+  // Address capture (typed message only) — polite and smart
+  if (session.step === 'collecting_address' && type === 'text') {
+    // If greeting/short chit-chat, don't scold; just guide and show options
+    if (isGreeting(text)) {
+      await safeSend(from, 'No worries — whenever you’re ready, please send your full address in one message.\nExample: "House 12, MG Road, Indore 452001"');
+      await sendHome(from, 'Meanwhile, you can continue:');
+      return;
+    }
+
+    // If looks like a real address → confirm with buttons
+    if (looksLikeAddress(text)) {
+      session.tempAddress = text;
+      await sessionRef.set({ ...session, updatedAt: Date.now() });
+      await sendButtons(from, `Save this address?\n${text}`, [
+        { id: 'addr_save', title: 'Save' },
+        { id: 'addr_edit', title: 'Change' },
+        { id: 'home:menu', title: 'Menu' },
+      ]);
+      return;
+    }
+
+    // Otherwise, gentle hint (rate-limited) + Show Options
+    const nowTs = Date.now();
+    const last = Number(session.addrHintShownAt || 0);
+    if (!last || nowTs - last > 30000) {
+      await safeSend(from, 'Address seems incomplete. Please send your full address (house, street, city, pincode).\nExample: "House 12, MG Road, Indore 452001"');
+      session.addrHintShownAt = nowTs;
+      await sessionRef.set({ ...session, updatedAt: nowTs });
+    }
+    await sendHome(from, 'You can continue other actions too:');
     return;
   }
 
-  if (lowerText.includes('agent') || lowerText.includes('human')) {
-    await sendMessage(from, `A human agent will reach out to you soon.`);
+  // Entry points
+  if (['hi', 'hello', 'start', 'menu', 'help'].includes(lower)) {
+    await sendHome(from);
     return;
   }
 
-  // 15) Privacy
-  if (/delete.*data|remove.*account/.test(lowerText)) {
-    await db.collection('users').doc(from).delete();
-    await db.collection('carts').doc(from).delete();
-    await db.collection('sessions').doc(from).delete();
-    await sendMessage(from, 'Your data has been deleted as per your request.');
-    return;
-  }
-  if (/export.*data|my.*data/.test(lowerText)) {
-    const userData = {};
-    const orders = await db.collection('orders').where('userId', '==', from).get();
-    userData.orders = [];
-    orders.forEach((doc) => userData.orders.push(doc.data()));
-    await sendMessage(from, `Your data export:\n${JSON.stringify(userData, null, 2).slice(0, 4000)}`);
-    return;
-  }
+  // Default
+  await sendHome(from);
+}
 
-  // 16) Default
-  await sendMessage(
-    from,
-    `👋 Welcome to Cloud Kitchen!\nReply:\n1 - Menu\n2 - Cart\n3 - Track Order\n4 - Place Order\n5 - Help\nType "address" to set your delivery address.`
-  );
-  await sessionRef.set({ ...session, updatedAt: Date.now() });
+// ============ Track & Reorder ============
+async function handleTrack(userId, showAfter = false) {
+  let latest;
+  try {
+    const snap = await db.collection('orders').where('userId', '==', userId).orderBy('createdAt', 'desc').limit(1).get();
+    latest = snap.empty ? null : snap.docs[0];
+  } catch {
+    const s = await db.collection('orders').where('userId', '==', userId).get();
+    if (s.empty) latest = null;
+    else latest = s.docs.sort((a, b) => String(b.data().createdAt || '').localeCompare(String(a.data().createdAt || '')))[0];
+  }
+  if (!latest) {
+    await safeSend(userId, 'No recent orders found.');
+    await sendHome(userId, 'What next?');
+    return;
+  }
+  const o = latest.data();
+  const total = Number(o?.totals?.finalTotal ?? o?.total ?? 0);
+  await safeSend(userId, `Order #${latest.id.slice(-5)} status: ${o.status}\nTotal: ₹${total}\nETA: ${o.deliveryETA || 'N/A'}\nRider: ${o.deliveryPerson || 'N/A'}\nAddress: ${o.deliveryAddress || '-'}`);
+  if (showAfter) await sendHome(userId, 'Need anything else?');
+}
+async function handleReorder(userId) {
+  let latest;
+  try {
+    const snap = await db.collection('orders').where('userId', '==', userId).orderBy('createdAt', 'desc').limit(1).get();
+    latest = snap.empty ? null : snap.docs[0];
+  } catch {
+    const s = await db.collection('orders').where('userId', '==', userId).get();
+    if (s.empty) latest = null;
+    else latest = s.docs.sort((a, b) => String(b.data().createdAt || '').localeCompare(String(a.data().createdAt || '')))[0];
+  }
+  if (!latest) {
+    await safeSend(userId, 'No recent orders to reorder.');
+    await sendHome(userId, 'What next?');
+    return;
+  }
+  const prev = latest.data();
+  const items = Array.isArray(prev.items) ? prev.items : [];
+  if (!items.length) {
+    await safeSend(userId, 'Last order has no items.');
+    await sendHome(userId, 'Choose another action:');
+    return;
+  }
+  const docs = await Promise.all(items.map((ci) => db.collection('menu').doc(ci.itemId).get()));
+  let baseTotal = 0;
+  items.forEach((ci, idx) => {
+    const m = docs[idx].exists ? docs[idx].data() : { price: 0 };
+    baseTotal += (m.price || 0) * (ci.qty || 1);
+  });
+  const now = nowIso();
+  const ref = await db.collection('orders').add({
+    userId,
+    items,
+    totals: { baseTotal, finalTotal: baseTotal },
+    total: baseTotal,
+    payment: { method: 'unknown', status: 'pending' },
+    status: 'pending_payment',
+    statusHistory: [{ status: 'pending_payment', at: now }],
+    deliveryAddress: prev.deliveryAddress || '',
+    createdAt: now,
+    updatedAt: now,
+    reorderOf: latest.id,
+  });
+  await safeSend(userId, `Reorder created (ID: ${ref.id}). Select payment from options.`);
+  await notifyAdmin(`🆕 Reorder\nID: ${ref.id}\nFrom: ${userId}\nTotal: ₹${baseTotal}`);
+  await sendPaymentButtons(userId, ref.id);
+  await sendHome(userId, 'You can open Show Options any time.');
 }
 
 module.exports = {
   handleIncoming,
+  sendHome,
   sendMenuList,
-  sendOrderConfirmationButtons,
+  sendCouponsPicker,
   sendMessage,
-  sendVideoLink,
-  clearExpiredSessions,
+  markOrderPaidAndNotify,
 };
